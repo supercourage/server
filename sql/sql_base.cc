@@ -4982,6 +4982,19 @@ handle_table(THD *thd, Query_tables_list *prelocking_ctx,
                                        lock_type))
           continue;
 
+        /*
+          Filter out intermediate tables of concurrent ALTER TABLE against FK
+          child table. We may hit those while preparing a statement that
+          intends to modify table. Subsequent execute shall wait for ALTER TABLE
+          completion and request re-prepare.
+        */
+        if (fk->foreign_table->length > MYSQL50_TABLE_NAME_PREFIX_LENGTH +
+                                        tmp_file_prefix_length &&
+            !memcmp(fk->foreign_table->str,
+                    C_STRING_WITH_LEN(MYSQL50_TABLE_NAME_PREFIX
+                                      tmp_file_prefix)))
+          continue;
+
         TABLE_LIST *tl= (TABLE_LIST *) thd->alloc(sizeof(TABLE_LIST));
         tl->init_one_table_for_prelocking(fk->foreign_db->str, fk->foreign_db->length,
                            fk->foreign_table->str, fk->foreign_table->length,
