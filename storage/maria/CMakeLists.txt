@@ -13,18 +13,11 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
-INCLUDE_DIRECTORIES(
-${SSL_INCLUDE_DIRS}
-)
+INCLUDE_DIRECTORIES(${SSL_INCLUDE_DIRS})
 
 IF(SSL_DEFINES)
-SET_SOURCE_FILES_PROPERTIES(ma_crypt.c PROPERTIES COMPILE_FLAGS ${SSL_DEFINES})
+  SET_SOURCE_FILES_PROPERTIES(ma_crypt.c PROPERTIES COMPILE_FLAGS ${SSL_DEFINES})
 ENDIF()
-
-SET(S3_SOURCES ha_s3.cc)
-
-SET_SOURCE_FILES_PROPERTIES(${S3_SOURCES} PROPERTIES COMPILE_FLAGS "-I/usr/local/include/libmarias3 -DWITH_S3_STORAGE_ENGINE")
-
 
 SET(ARIA_SOURCES ma_init.c ma_open.c ma_extra.c ma_info.c ma_rkey.c 
             ma_rnext.c ma_rnext_same.c 
@@ -50,29 +43,17 @@ SET(ARIA_SOURCES ma_init.c ma_open.c ma_extra.c ma_info.c ma_rkey.c
             ma_checkpoint.c ma_recovery.c ma_commit.c ma_pagecrc.c
             ha_maria.h maria_def.h ma_recovery_util.c ma_servicethread.c
             ma_norec.c
-            ma_crypt.c ma_backup.c s3_func.c
+            ma_crypt.c ma_backup.c
 )
-
-SET_SOURCE_FILES_PROPERTIES(${ARIA_SOURCES} PROPERTIES COMPILE_FLAGS "-I/usr/local/include/libmarias3 -DWITH_S3_STORAGE_ENGINE")
 
 IF(APPLE)
   # Workaround linker bug on OSX 10.7
   ADD_DEFINITIONS(-fno-common)
 ENDIF()
 
-MYSQL_ADD_PLUGIN(aria ${ARIA_SOURCES} 
-  STORAGE_ENGINE
-  MANDATORY
-  RECOMPILE_FOR_EMBEDDED)
-
-MYSQL_ADD_PLUGIN(s3 ${S3_SOURCES} STORAGE_ENGINE DEFAULT)
-
-IF(NOT WITH_ARIA_STORAGE_ENGINE)
-  RETURN()
-ENDIF()
-
-TARGET_LINK_LIBRARIES(aria myisam mysys mysys_ssl -L/usr/local/lib64 marias3 curl)
-TARGET_LINK_LIBRARIES(s3 aria myisam mysys mysys_ssl)
+MYSQL_ADD_PLUGIN(aria ${ARIA_SOURCES} STORAGE_ENGINE MANDATORY
+                 LINK_LIBRARIES myisam mysys mysys_ssl
+                 RECOMPILE_FOR_EMBEDDED)
 
 MYSQL_ADD_EXECUTABLE(aria_ftdump maria_ftdump.c COMPONENT Server)
 TARGET_LINK_LIBRARIES(aria_ftdump aria)
@@ -89,12 +70,6 @@ SET_TARGET_PROPERTIES(aria_dump_log PROPERTIES COMPILE_FLAGS "-DMARIA_DUMP_LOG")
 
 MYSQL_ADD_EXECUTABLE(aria_pack maria_pack.c COMPONENT Server)
 TARGET_LINK_LIBRARIES(aria_pack aria)
-
-IF(WITH_S3_STORAGE_ENGINE)
-  MYSQL_ADD_EXECUTABLE(aria_s3_copy aria_s3_copy.cc COMPONENT Server)
-  TARGET_LINK_LIBRARIES(aria_s3_copy s3 -L/usr/local/lib64 marias3 curl)
-  SET_TARGET_PROPERTIES(aria_s3_copy PROPERTIES COMPILE_FLAGS "-I/usr/local/include/libmarias3 -DWITH_S3_STORAGE_ENGINE")
-ENDIF()
 
 IF(WITH_UNIT_TESTS)
   ADD_EXECUTABLE(ma_test1 ma_test1.c)
@@ -125,3 +100,33 @@ ENDIF()
 
 OPTION(USE_ARIA_FOR_TMP_TABLES "Use Aria for temporary tables" ON)
 
+#
+# S3
+#
+INCLUDE (CheckIncludeFiles)
+
+SET(S3_SOURCES ha_s3.cc s3_func.c
+    libmarias3/src/debug.c libmarias3/src/error.c libmarias3/src/marias3.c
+    libmarias3/src/request.c libmarias3/src/response.c)
+
+IF(NOT PLUGIN_S3 STREQUAL NO)
+  FIND_PACKAGE(LibXml2)
+  FIND_PACKAGE(CURL)
+  CHECK_INCLUDE_FILES (mhash.h HAVE_MHASH_H)
+ENDIF()
+
+IF (LIBXML2_FOUND AND CURL_FOUND AND HAVE_MHASH_H)
+  MYSQL_ADD_PLUGIN(s3 ${S3_SOURCES} STORAGE_ENGINE STATIC_ONLY
+                   LINK_LIBRARIES aria myisam mysys mysys_ssl xml2 curl mhash
+                   RECOMPILE_FOR_EMBEDDED)
+ENDIF()
+
+IF(TARGET s3)
+  MYSQL_ADD_EXECUTABLE(aria_s3_copy aria_s3_copy.cc COMPONENT Server)
+  TARGET_LINK_LIBRARIES(aria_s3_copy s3)
+
+  INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/libmarias3 ${LIBXML2_INCLUDE_DIR})
+  ADD_DEFINITIONS(-DWITH_S3_STORAGE_ENGINE)
+
+  TARGET_LINK_LIBRARIES(aria s3)
+ENDIF()

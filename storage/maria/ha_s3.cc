@@ -63,7 +63,7 @@
 #include "sql_class.h"
 #include <mysys_err.h>
 C_MODE_START
-#include <marias3.h>
+#include <libmarias3/marias3.h>
 C_MODE_END
 #include "ha_s3.h"
 #include "s3_func.h"

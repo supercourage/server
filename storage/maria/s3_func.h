@@ -1,5 +1,5 @@
-#ifndef HA_S3_FUNC_INCLUDED
-#define HA_S3_FUNC_INCLUDED
+#ifndef S3_FUNC_INCLUDED
+#define S3_FUNC_INCLUDED
 /* Copyright (C) 2019 MariaDB Corporation Ab
 
    This program is free software; you can redistribute it and/or modify
@@ -21,7 +21,7 @@
 
 #ifdef WITH_S3_STORAGE_ENGINE
 C_MODE_START
-#include <marias3.h>
+#include <libmarias3/marias3.h>
 
 /* Store information about a s3 connection */
 

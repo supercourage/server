@@ -25,7 +25,7 @@
 #include <mysqld_error.h>
 #include <zlib.h>
 C_MODE_START
-#include <marias3.h>
+#include <libmarias3/marias3.h>
 C_MODE_END
 #include "s3_func.h"
 
