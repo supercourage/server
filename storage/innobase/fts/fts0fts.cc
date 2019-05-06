@@ -834,17 +834,17 @@ fts_drop_index(
 	dberr_t		err = DB_SUCCESS;
 
 	ut_a(indexes);
+	const ulint size = ib_vector_size(indexes);
 
-	if ((ib_vector_size(indexes) == 1
-	    && (index == static_cast<dict_index_t*>(
-			ib_vector_getp(table->fts->indexes, 0))))
-	   || ib_vector_is_empty(indexes)) {
+	const bool remove_the_only_index = size == 0
+		|| (size == 1
+		    && index == static_cast<dict_index_t*>(
+			    ib_vector_getp(table->fts->indexes, 0)));
+	fts_optimize_remove_table(table);
+
+	if (remove_the_only_index) {
 		doc_id_t	current_doc_id;
 		doc_id_t	first_doc_id;
-
-		/* If we are dropping the only FTS index of the table,
-		remove it from optimize thread */
-		fts_optimize_remove_table(table);
 
 		DICT_TF2_FLAG_UNSET(table, DICT_TF2_FTS);
 
@@ -859,19 +859,9 @@ fts_drop_index(
 
 			err = fts_drop_index_tables(trx, index);
 
-			while (index->index_fts_syncing
-				&& !trx_is_interrupted(trx)) {
-				DICT_BG_YIELD(trx);
-			}
-
 			fts_free(table);
 
 			return(err);
-		}
-
-		while (index->index_fts_syncing
-		       && !trx_is_interrupted(trx)) {
-			DICT_BG_YIELD(trx);
 		}
 
 		current_doc_id = table->fts->cache->next_doc_id;
@@ -890,10 +880,6 @@ fts_drop_index(
 		index_cache = fts_find_index_cache(cache, index);
 
 		if (index_cache != NULL) {
-			while (index->index_fts_syncing
-			       && !trx_is_interrupted(trx)) {
-				DICT_BG_YIELD(trx);
-			}
 			if (index_cache->words) {
 				fts_words_free(index_cache->words);
 				rbt_free(index_cache->words);
@@ -912,6 +898,10 @@ fts_drop_index(
 	err = fts_drop_index_tables(trx, index);
 
 	ib_vector_remove(indexes, (const void*) index);
+
+	if (!remove_the_only_index) {
+		fts_optimize_add_table(table);
+	}
 
 	return(err);
 }
@@ -1532,11 +1522,12 @@ fts_rename_aux_tables(
 
 	FTS_INIT_FTS_TABLE(&fts_table, NULL, FTS_COMMON_TABLE, table);
 
+	fts_optimize_remove_table(table);
+	dberr_t err = DB_SUCCESS;
+	char old_table_name[MAX_FULL_NAME_LEN];
+
 	/* Rename common auxiliary tables */
 	for (i = 0; fts_common_tables[i] != NULL; ++i) {
-		char	old_table_name[MAX_FULL_NAME_LEN];
-		dberr_t	err = DB_SUCCESS;
-
 		fts_table.suffix = fts_common_tables[i];
 
 		fts_get_table_name(&fts_table, old_table_name);
@@ -1544,7 +1535,7 @@ fts_rename_aux_tables(
 		err = fts_rename_one_aux_table(new_name, old_table_name, trx);
 
 		if (err != DB_SUCCESS) {
-			return(err);
+			return err;
 		}
 	}
 
@@ -1561,9 +1552,6 @@ fts_rename_aux_tables(
 		FTS_INIT_INDEX_TABLE(&fts_table, NULL, FTS_INDEX_TABLE, index);
 
 		for (ulint j = 0; j < FTS_NUM_AUX_INDEX; ++j) {
-			dberr_t	err;
-			char	old_table_name[MAX_FULL_NAME_LEN];
-
 			fts_table.suffix = fts_get_suffix(j);
 
 			fts_get_table_name(&fts_table, old_table_name);
@@ -1581,6 +1569,10 @@ fts_rename_aux_tables(
 		}
 	}
 
+	/* On rename error, we do not add the table to the fts_sync
+	queue on purpose, in order to avoid a crash. The fulltext
+	indexes will likely be corrupted. */
+	fts_optimize_add_table(table);
 	return(DB_SUCCESS);
 }
 
@@ -4414,7 +4406,6 @@ begin_sync:
 
 		DBUG_EXECUTE_IF("fts_instrument_sync_before_syncing",
 				os_thread_sleep(300000););
-		index_cache->index->index_fts_syncing = true;
 
 		error = fts_sync_index(sync, index_cache);
 
@@ -4453,13 +4444,6 @@ end_sync:
 	}
 
 	rw_lock_x_lock(&cache->lock);
-	/* Clear fts syncing flags of any indexes in case sync is
-	interrupted */
-	for (i = 0; i < ib_vector_size(cache->indexes); ++i) {
-		static_cast<fts_index_cache_t*>(
-			ib_vector_get(cache->indexes, i))
-			->index->index_fts_syncing = false;
-	}
 
 	sync->interrupted = false;
 	sync->in_progress = false;

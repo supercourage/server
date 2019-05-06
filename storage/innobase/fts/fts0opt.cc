@@ -62,11 +62,9 @@ static ib_time_t	last_check_sync_time;
 
 /** State of a table within the optimization sub system. */
 enum fts_state_t {
-	FTS_STATE_LOADED,
 	FTS_STATE_RUNNING,
 	FTS_STATE_SUSPENDED,
-	FTS_STATE_DONE,
-	FTS_STATE_EMPTY
+	FTS_STATE_DONE
 };
 
 /** FTS optimize thread message types. */
@@ -177,9 +175,8 @@ struct fts_encode_t {
 /** We use this information to determine when to start the optimize
 cycle for a table. */
 struct fts_slot_t {
-	dict_table_t*	table;		/*!< Table to optimize */
-
-	table_id_t	table_id;	/*!< Table id */
+	/** table identifier, or 0 if the slot is empty */
+	table_id_t	table_id;
 
 	fts_state_t	state;		/*!< State of this slot */
 
@@ -2392,18 +2389,20 @@ fts_optimize_table_bk(
 	fts_slot_t*	slot)	/*!< in: table to optimiza */
 {
 	dberr_t		error;
-	dict_table_t*	table = slot->table;
-	fts_t*		fts = table->fts;
 
 	/* Avoid optimizing tables that were optimized recently. */
 	if (slot->last_run > 0
 	    && (ut_time() - slot->last_run) < slot->interval_time) {
 
 		return(DB_SUCCESS);
+	}
 
-	} else if (fts && fts->cache
-		   && fts->cache->deleted >= FTS_OPTIMIZE_THRESHOLD) {
+	dict_table_t* table = dict_table_open_on_id(
+		slot->table_id, FALSE, DICT_TABLE_OP_NORMAL);
 
+	if (table && fil_table_accessible(table)
+	    && table->fts && table->fts->cache
+	    && table->fts->cache->deleted >= FTS_OPTIMIZE_THRESHOLD) {
 		error = fts_optimize_table(table);
 
 		if (error == DB_SUCCESS) {
@@ -2415,6 +2414,7 @@ fts_optimize_table_bk(
 		error = DB_SUCCESS;
 	}
 
+	dict_table_close(table, FALSE, FALSE);
 	/* Note time this run completed. */
 	slot->last_run = ut_time();
 
@@ -2633,85 +2633,59 @@ fts_optimize_request_sync_table(
 	ib_wqueue_add(fts_optimize_wq, msg, msg->heap);
 }
 
-/**********************************************************************//**
-Add the table to the vector if it doesn't already exist. */
-static
-ibool
-fts_optimize_new_table(
-/*===================*/
-	ib_vector_t*	tables,			/*!< in/out: vector of tables */
-	dict_table_t*	table)			/*!< in: table to add */
+/** Add a table to fts_slots if it doesn't already exist. */
+static bool fts_optimize_new_table(dict_table_t* table)
 {
 	ulint		i;
 	fts_slot_t*	slot;
-	ulint		empty_slot = ULINT_UNDEFINED;
+	fts_slot_t*	empty = NULL;
+	const table_id_t table_id = table->id;
+	ut_ad(table_id);
 
 	/* Search for duplicates, also find a free slot if one exists. */
-	for (i = 0; i < ib_vector_size(tables); ++i) {
+	for (i = 0; i < ib_vector_size(fts_slots); ++i) {
 
-		slot = static_cast<fts_slot_t*>(
-			ib_vector_get(tables, i));
+		slot = static_cast<fts_slot_t*>(ib_vector_get(fts_slots, i));
 
-		if (slot->state == FTS_STATE_EMPTY) {
-			empty_slot = i;
-		} else if (slot->table == table) {
+		if (!slot->table_id) {
+			empty = slot;
+		} else if (slot->table_id == table_id) {
 			/* Already exists in our optimize queue. */
-			ut_ad(slot->table_id == table->id);
 			return(FALSE);
 		}
 	}
 
-	/* Reuse old slot. */
-	if (empty_slot != ULINT_UNDEFINED) {
-
-		slot = static_cast<fts_slot_t*>(
-			ib_vector_get(tables, empty_slot));
-
-		ut_a(slot->state == FTS_STATE_EMPTY);
-
-	} else { /* Create a new slot. */
-
-		slot = static_cast<fts_slot_t*>(ib_vector_push(tables, NULL));
-	}
+	slot = empty ? empty : static_cast<fts_slot_t*>(
+		ib_vector_push(fts_slots, NULL));
 
 	memset(slot, 0x0, sizeof(*slot));
 
-	slot->table = table;
 	slot->table_id = table->id;
-	slot->state = FTS_STATE_LOADED;
+	slot->state = FTS_STATE_DONE;
 	slot->interval_time = FTS_OPTIMIZE_INTERVAL_IN_SECS;
 
 	return(TRUE);
 }
 
-/**********************************************************************//**
-Remove the table from the vector if it exists. */
-static
-ibool
-fts_optimize_del_table(
-/*===================*/
-	ib_vector_t*	tables,			/*!< in/out: vector of tables */
-	fts_msg_del_t*	msg)			/*!< in: table to delete */
+/** Remove a table from fts_slots if it exists.
+@param[in,out]	table	table to be removed from fts_slots */
+static bool fts_optimize_del_table(const dict_table_t* table)
 {
-	ulint		i;
-	dict_table_t*	table = msg->table;
+	const table_id_t table_id = table->id;
+	ut_ad(table_id);
 
-	for (i = 0; i < ib_vector_size(tables); ++i) {
+	for (ulint i = 0; i < ib_vector_size(fts_slots); ++i) {
 		fts_slot_t*	slot;
 
-		slot = static_cast<fts_slot_t*>(ib_vector_get(tables, i));
+		slot = static_cast<fts_slot_t*>(ib_vector_get(fts_slots, i));
 
-		if (slot->state != FTS_STATE_EMPTY
-		    && slot->table == table) {
-
+		if (slot->table_id == table_id) {
 			if (fts_enable_diag_print) {
 				ib::info() << "FTS Optimize Removing table "
 					<< table->name;
 			}
 
-			slot->table = NULL;
-			slot->state = FTS_STATE_EMPTY;
-
+			slot->table_id = 0;
 			return(TRUE);
 		}
 	}
@@ -2720,14 +2694,9 @@ fts_optimize_del_table(
 }
 
 /**********************************************************************//**
-Calculate how many of the registered tables need to be optimized.
+Calculate how many tables in fts_slots need to be optimized.
 @return no. of tables to optimize */
-static
-ulint
-fts_optimize_how_many(
-/*==================*/
-	const ib_vector_t*	tables)		/*!< in: registered tables
-						vector*/
+static ulint fts_optimize_how_many()
 {
 	ulint		i;
 	ib_time_t	delta;
@@ -2736,15 +2705,15 @@ fts_optimize_how_many(
 
 	current_time = ut_time();
 
-	for (i = 0; i < ib_vector_size(tables); ++i) {
-		const fts_slot_t*	slot;
-
-		slot = static_cast<const fts_slot_t*>(
-			ib_vector_get_const(tables, i));
+	for (i = 0; i < ib_vector_size(fts_slots); ++i) {
+		const fts_slot_t* slot = static_cast<const fts_slot_t*>(
+			ib_vector_get_const(fts_slots, i));
+		if (slot->table_id == 0) {
+			continue;
+		}
 
 		switch (slot->state) {
 		case FTS_STATE_DONE:
-		case FTS_STATE_LOADED:
 			ut_a(slot->completed <= current_time);
 
 			delta = current_time - slot->completed;
@@ -2767,7 +2736,6 @@ fts_optimize_how_many(
 
 			/* Slots in a state other than the above
 			are ignored. */
-		case FTS_STATE_EMPTY:
 		case FTS_STATE_SUSPENDED:
 			break;
 		}
@@ -2780,12 +2748,7 @@ fts_optimize_how_many(
 /**********************************************************************//**
 Check if the total memory used by all FTS table exceeds the maximum limit.
 @return true if a sync is needed, false otherwise */
-static
-bool
-fts_is_sync_needed(
-/*===============*/
-	const ib_vector_t*	tables)		/*!< in: registered tables
-						vector*/
+static bool fts_is_sync_needed()
 {
 	ulint	total_memory = 0;
 	double	time_diff = difftime(ut_time(), last_check_sync_time);
@@ -2796,16 +2759,25 @@ fts_is_sync_needed(
 
 	last_check_sync_time = ut_time();
 
-	for (ulint i = 0; i < ib_vector_size(tables); ++i) {
-		const fts_slot_t*	slot;
+	for (ulint i = 0; i < ib_vector_size(fts_slots); ++i) {
+		const fts_slot_t* slot = static_cast<const fts_slot_t*>(
+			ib_vector_get_const(fts_slots, i));
 
-		slot = static_cast<const fts_slot_t*>(
-			ib_vector_get_const(tables, i));
-
-		if (slot->state != FTS_STATE_EMPTY && slot->table
-		    && slot->table->fts && slot->table->fts->cache) {
-			total_memory += slot->table->fts->cache->total_size;
+		if (slot->table_id == 0) {
+			continue;
 		}
+
+		dict_table_t* table = dict_table_open_on_id(
+			slot->table_id, FALSE, DICT_TABLE_OP_NORMAL);
+		if (!table) {
+			continue;
+		}
+
+		if (table->fts && table->fts->cache) {
+			total_memory += table->fts->cache->total_size;
+		}
+
+		dict_table_close(table, FALSE, FALSE);
 
 		if (total_memory > fts_max_total_cache_size) {
 			return(true);
@@ -2817,16 +2789,12 @@ fts_is_sync_needed(
 
 /** Sync fts cache of a table
 @param[in]	table_id	table id */
-void
-fts_optimize_sync_table(
-	table_id_t	table_id)
+static void fts_optimize_sync_table(table_id_t table_id)
 {
-	dict_table_t*   table = NULL;
-
-	table = dict_table_open_on_id(table_id, FALSE, DICT_TABLE_OP_NORMAL);
-
-	if (table) {
-		if (dict_table_has_fts_index(table) && table->fts->cache) {
+	if (dict_table_t* table = dict_table_open_on_id(
+		    table_id, FALSE, DICT_TABLE_OP_NORMAL)) {
+		if (fil_table_accessible(table)
+		    && table->fts && table->fts->cache) {
 			fts_sync_table(table, true, false, false);
 		}
 
@@ -2866,28 +2834,18 @@ fts_optimize_thread(
 		    && ib_wqueue_is_empty(wq)
 		    && n_tables > 0
 		    && n_optimize > 0) {
-
-			fts_slot_t*	slot;
-
-			ut_a(ib_vector_size(fts_slots) > 0);
-
-			slot = static_cast<fts_slot_t*>(
+			fts_slot_t* slot = static_cast<fts_slot_t*>(
 				ib_vector_get(fts_slots, current));
 
 			/* Handle the case of empty slots. */
-			if (slot->state != FTS_STATE_EMPTY) {
-
+			if (slot->table_id) {
 				slot->state = FTS_STATE_RUNNING;
-
 				fts_optimize_table_bk(slot);
 			}
 
-			++current;
-
 			/* Wrap around the counter. */
-			if (current >= ib_vector_size(fts_slots)) {
-				n_optimize = fts_optimize_how_many(fts_slots);
-
+			if (++current >= ib_vector_size(fts_slots)) {
+				n_optimize = fts_optimize_how_many();
 				current = 0;
 			}
 
@@ -2899,7 +2857,7 @@ fts_optimize_thread(
 
 			/* Timeout ? */
 			if (msg == NULL) {
-				if (fts_is_sync_needed(fts_slots)) {
+				if (fts_is_sync_needed()) {
 					fts_need_sync = true;
 				}
 
@@ -2914,7 +2872,6 @@ fts_optimize_thread(
 			case FTS_MSG_ADD_TABLE:
 				ut_a(!done);
 				if (fts_optimize_new_table(
-					fts_slots,
 					static_cast<dict_table_t*>(
 					msg->ptr))) {
 					++n_tables;
@@ -2923,8 +2880,8 @@ fts_optimize_thread(
 
 			case FTS_MSG_DEL_TABLE:
 				if (fts_optimize_del_table(
-					fts_slots, static_cast<fts_msg_del_t*>(
-						msg->ptr))) {
+					    static_cast<fts_msg_del_t*>(
+						    msg->ptr)->table)) {
 					--n_tables;
 				}
 
@@ -2948,12 +2905,7 @@ fts_optimize_thread(
 			}
 
 			mem_heap_free(msg->heap);
-
-			if (!done) {
-				n_optimize = fts_optimize_how_many(fts_slots);
-			} else {
-				n_optimize = 0;
-			}
+			n_optimize = done ? 0 : fts_optimize_how_many();
 		}
 	}
 
@@ -2968,8 +2920,8 @@ fts_optimize_thread(
 			slot = static_cast<fts_slot_t*>(
 				ib_vector_get(fts_slots, i));
 
-			if (slot->state != FTS_STATE_EMPTY) {
-				fts_optimize_sync_table(slot->table_id);
+			if (table_id_t table_id = slot->table_id) {
+				fts_optimize_sync_table(table_id);
 			}
 		}
 	}
@@ -3022,8 +2974,7 @@ fts_optimize_init(void)
              table = UT_LIST_GET_NEXT(table_LRU, table)) {
                 if (table->fts &&
                     dict_table_has_fts_index(table)) {
-			if (fts_optimize_new_table(fts_slots,
-						   table)){
+			if (fts_optimize_new_table(table)){
 				table_vector.push_back(table);
 			}
 		}
